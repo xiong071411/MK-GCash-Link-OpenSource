@@ -1,6 +1,6 @@
 # MK GCash Link
 
-独立、无 CDK、无平台节点的 GCash 提链工作台。用户必须提供自己的 ChatGPT AT 和 PH 住宅代理池。
+独立、造福大家的GCash 提链工作台。用户必须提供自己的 ChatGPT AT 和 PH 住宅代理池。
 
 ## 功能边界
 
