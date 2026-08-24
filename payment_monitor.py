@@ -59,7 +59,8 @@ CONTINUE_CONTEXT_HEADER_NAMES = frozenset({
     "x-openai-target-route",
 })
 FRONTEND_CONTEXT_COOKIE_NAMES = frozenset({
-    "oai-did", "cf_clearance", "__cf_bm", "__cfseq",
+    "oai-did", "__Secure-next-auth.session-token",
+    "cf_clearance", "__cf_bm", "__cfseq",
     "cf_chl_rc_i", "cf_chl_rc_ni", "cf_chl_rc_m",
 })
 

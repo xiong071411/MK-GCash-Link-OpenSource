@@ -20,6 +20,7 @@ from gcash_chain import (
     QueueFullError,
     _ensure_full_chain_proxy_supported,
     _parse_proxy,
+    _proxy_ref,
 )
 
 
@@ -71,10 +72,48 @@ def _token_from_text(value):
     return match.group(1) if match else ""
 
 
+def _context_from_item(item):
+    if not isinstance(item, dict):
+        return {}
+    limits = {
+        "session_token": 65_536,
+        "device_id": 256,
+        "account_id": 256,
+        "browser_profile": 64,
+        "proxy_ref": 64,
+        "registered_at": 128,
+    }
+    context = {
+        key: str(item.get(key) or "").strip()[:limit]
+        for key, limit in limits.items()
+    }
+    proxy_ref = context.get("proxy_ref", "").lower()
+    if proxy_ref and not re.fullmatch(r"[a-f0-9]{16}", proxy_ref):
+        raise ValueError("proxy_ref 格式无效")
+    context["proxy_ref"] = proxy_ref
+    return context
+
+
 def _line_fields(line):
     line = str(line or "").strip()
     if not line:
-        return "", "", ""
+        return "", "", "", {}
+    if line.startswith("{"):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            item = None
+        if isinstance(item, dict):
+            token = _token_from_text(
+                item.get("access_token") or item.get("token")
+                or item.get("authorization")
+            )
+            return (
+                token,
+                str(item.get("email") or "").strip(),
+                str(item.get("name") or "").strip(),
+                _context_from_item(item),
+            )
     email = ""
     name = ""
     parts = [part.strip() for part in line.split("|")]
@@ -87,10 +126,10 @@ def _line_fields(line):
             email = parts[0]
         else:
             name = parts[0]
-    return _token_from_text(line), email, name
+    return _token_from_text(line), email, name, {}
 
 
-def _account_from_token(token, explicit_email="", explicit_name=""):
+def _account_from_token(token, explicit_email="", explicit_name="", context=None):
     if not token or len(token) > 32_768:
         raise ValueError("AT 格式无效")
     payload = _decode_jwt_payload(token)
@@ -119,18 +158,27 @@ def _account_from_token(token, explicit_email="", explicit_name=""):
         or payload.get("given_name")
         or ""
     ).strip()
-    account_id = str(
+    token_account_id = str(
         auth.get("chatgpt_account_id")
         or payload.get("chatgpt_account_id")
         or payload.get("account_id")
         or ""
     ).strip()
+    context = _context_from_item(context)
+    context_account_id = context.get("account_id", "")
+    if token_account_id and context_account_id and token_account_id != context_account_id:
+        raise ValueError("提链包账号与 AT 账号不一致")
     return {
         "token": token,
         "email": email,
         "name": name,
-        "account_id": account_id,
+        "account_id": token_account_id or context_account_id,
         "expires_at": expires_at,
+        "session_token": context.get("session_token", ""),
+        "device_id": context.get("device_id", ""),
+        "browser_profile": context.get("browser_profile", "") or "chrome136",
+        "proxy_ref": context.get("proxy_ref", ""),
+        "registered_at": context.get("registered_at", ""),
     }
 
 
@@ -143,8 +191,12 @@ def parse_accounts(payload):
         for line_number, line in enumerate(raw_text.splitlines(), 1):
             if not line.strip():
                 continue
-            token, email, name = _line_fields(line)
-            candidates.append((line_number, token, email, name))
+            try:
+                token, email, name, context = _line_fields(line)
+            except ValueError as exc:
+                candidates.append((line_number, "", "", "", {"parse_error": str(exc)}))
+                continue
+            candidates.append((line_number, token, email, name, context))
 
     raw_accounts = payload.get("accounts", [])
     if raw_accounts:
@@ -153,7 +205,7 @@ def parse_accounts(payload):
         base_line = len(candidates)
         for index, item in enumerate(raw_accounts, 1):
             if not isinstance(item, dict):
-                candidates.append((base_line + index, "", "", ""))
+                candidates.append((base_line + index, "", "", "", {}))
                 continue
             token = _token_from_text(
                 item.get("access_token") or item.get("token") or item.get("authorization")
@@ -163,6 +215,7 @@ def parse_accounts(payload):
                 token,
                 str(item.get("email") or "").strip(),
                 str(item.get("name") or "").strip(),
+                _context_from_item(item),
             ))
 
     if not candidates:
@@ -173,7 +226,10 @@ def parse_accounts(payload):
     parsed = []
     warnings = []
     seen = set()
-    for line_number, token, email, name in candidates:
+    for line_number, token, email, name, context in candidates:
+        if context.get("parse_error"):
+            warnings.append({"line": line_number, "error": context["parse_error"]})
+            continue
         if not token:
             warnings.append({"line": line_number, "error": "未找到 JWT AT"})
             continue
@@ -182,11 +238,12 @@ def parse_accounts(payload):
             warnings.append({"line": line_number, "error": "重复 AT，已跳过"})
             continue
         try:
-            account = _account_from_token(token, email, name)
+            account = _account_from_token(token, email, name, context)
         except ValueError as exc:
             warnings.append({"line": line_number, "error": str(exc)})
             continue
         seen.add(token_hash)
+        account["source_line"] = line_number
         parsed.append(account)
     if not parsed:
         raise ValueError(warnings[0]["error"] if warnings else "没有可用账号")
@@ -238,6 +295,9 @@ def create_job(payload):
         raise ValueError("开源版仅支持用户自备代理池")
     accounts, warnings = parse_accounts(payload)
     proxy_pool = parse_proxy_pool(payload.get("proxy_pool", []))
+    proxies_by_ref = {}
+    for proxy in proxy_pool:
+        proxies_by_ref.setdefault(_proxy_ref(proxy), proxy)
     try:
         max_attempts = int(payload.get("max_attempts", 5))
     except (TypeError, ValueError) as exc:
@@ -251,10 +311,19 @@ def create_job(payload):
     account_meta = {}
     for index, account in enumerate(accounts):
         client_id = "acct_" + secrets.token_hex(8)
+        requested_proxy_ref = account.get("proxy_ref") or ""
+        matched_proxy = proxies_by_ref.get(requested_proxy_ref) if requested_proxy_ref else None
+        assigned_proxy = matched_proxy or proxy_pool[index % len(proxy_pool)]
+        if requested_proxy_ref and not matched_proxy:
+            warnings.append({
+                "line": account.get("source_line") or index + 1,
+                "error": "本次代理池未找到注册节点，已使用备用节点",
+            })
         account_meta[client_id] = {
             "email": account["email"],
             "name": account["name"],
             "expires_at": account["expires_at"],
+            "registered_at": account.get("registered_at", ""),
         }
         task_payloads.append({
             "token": account["token"],
@@ -262,9 +331,15 @@ def create_job(payload):
             "billing_email": account["email"],
             "billing_name": account["name"],
             "client_account_id": client_id,
-            "proxy": proxy_pool[index % len(proxy_pool)],
+            "proxy": assigned_proxy,
             "proxy_pool": proxy_pool,
             "max_attempts": max_attempts,
+            "session_token": account.get("session_token", ""),
+            "device_id": account.get("device_id", ""),
+            "browser_profile": account.get("browser_profile", "chrome136"),
+            "registered_at": account.get("registered_at", ""),
+            "proxy_ref": requested_proxy_ref,
+            "proxy_affinity": bool(matched_proxy),
         })
     try:
         CHAIN_MANAGER.submit_jobs(job_id, task_payloads)
@@ -300,6 +375,31 @@ def _task(job_id, client_id):
     raise KeyError("账号任务不存在")
 
 
+def _redact_task_text(task, value):
+    text = str(value or "")
+    private_values = (
+        task.get("token"),
+        task.get("session_token"),
+        task.get("account_id"),
+        task.get("proxy"),
+    )
+    for private in private_values:
+        private = str(private or "")
+        if private:
+            text = text.replace(private, "<redacted>")
+    return JWT_RE.sub("<redacted>", text)[:1000]
+
+
+def _task_context_flags(task):
+    return {
+        "session_cookie": bool(task.get("session_token")),
+        "registration_device": bool(task.get("device_id")),
+        "browser_profile": str(task.get("browser_profile") or "chrome136")[:64],
+        "proxy_affinity": bool(task.get("proxy_affinity")),
+        "registered_at": str(task.get("registered_at") or "")[:128],
+    }
+
+
 def _public_task(job_id, task, meta):
     client_id = task.get("client_account_id") or ""
     account = meta["accounts"].get(client_id, {})
@@ -318,6 +418,19 @@ def _public_task(job_id, task, meta):
     status = task.get("status") or "queued"
     link = task.get("gcash_url") or monitor.get("gcash_url") or ""
     qr_ready = bool(monitor.get("qr_ready"))
+    context_flags = _task_context_flags(task)
+    diagnostics = [
+        {
+            "status": str(attempt.get("status") or "failed"),
+            "step": str(attempt.get("step") or ""),
+            "error": _redact_task_text(task, attempt.get("error")),
+            "proxy_ref": str(attempt.get("proxy_ref") or "")[:16],
+            "retry_reason": str(attempt.get("retry_reason") or "")[:160],
+            "context": context_flags,
+        }
+        for attempt in (task.get("attempt_history") or [])
+        if isinstance(attempt, dict)
+    ]
     return {
         "id": client_id,
         "email": account.get("email") or "",
@@ -327,7 +440,11 @@ def _public_task(job_id, task, meta):
         "steps": task.get("steps") or [],
         "queue_position": task.get("queue_position"),
         "attempts_used": int(task.get("attempts_used") or 0),
-        "error": task.get("error_message") or callback_error,
+        "error": _redact_task_text(
+            task, task.get("error_message") or callback_error
+        ),
+        "risk_context": context_flags,
+        "attempt_diagnostics": diagnostics,
         "link_ready": status == "success" and bool(link),
         "link": link,
         "expires_at": monitor.get("expires_at") or task.get("expires_at"),
@@ -355,8 +472,26 @@ def public_job(job_id):
         "done": bool(session.get("done")),
         "accounts": items,
         "warnings": list(meta.get("warnings") or []),
+        "created_at": int(meta.get("created") or 0),
         "queue": CHAIN_MANAGER.queue_status(),
     }
+
+
+def public_jobs():
+    _cleanup_meta()
+    with JOB_META_LOCK:
+        job_ids = [
+            job_id for job_id, _meta in sorted(
+                JOB_META.items(), key=lambda item: item[1].get("created", 0), reverse=True
+            )
+        ]
+    jobs = []
+    for job_id in job_ids:
+        try:
+            jobs.append(public_job(job_id))
+        except KeyError:
+            continue
+    return {"jobs": jobs, "queue": CHAIN_MANAGER.queue_status()}
 
 
 def cancel_job(job_id):
@@ -494,6 +629,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "queue": CHAIN_MANAGER.queue_status(),
                     "limits": {"max_accounts": MAX_ACCOUNTS},
                 })
+            if path == "/api/jobs":
+                return self._json(public_jobs())
             match = re.fullmatch(r"/api/jobs/(local_[a-f0-9]{16})", path)
             if match:
                 return self._json(public_job(match.group(1)))

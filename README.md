@@ -7,12 +7,13 @@
 - 按浏览器成功链路执行建单、税费、confirm、custom method start、GCash 页面和回调监控。
 - 优惠随建单提交，不再额外调用 `checkout/update`；建单遇到风控拒绝时生成 `chatgpt_checkout` Sentinel 后原会话重试，confirm 使用独立的 `checkout_session_approval` Sentinel。
 - Sentinel 由随项目发布的 Node/V8 运行时生成，并保持同一 device、Cookie、页面上下文和 PH 代理出口。
-- 单次任务固定使用同一 Chrome/TLS 配置，重试时只轮换代理和 Checkout 状态。
+- 可直接导入注册项目导出的 JSONL 提链包，复用注册 Session、设备 ID、Chrome 136 配置，并按匿名 `proxy_ref` 匹配本次重新提供的原注册节点。
+- 同一账号的外层网络重试保持 Session、设备和 Chrome/TLS 配置不变；`unusual activity` 在同会话 Sentinel 重试后直接停止，不再跨节点连续重试。
 - 提供与 CDK 版一致的双步骤工作台，可在本地解析、筛选并选择需要提链的账号。
 - 支持真实二维码，抓取失败时回退为使用已验证 GCash 链接生成的二维码。
 - 支持复制链接、保存/刷新二维码、停止提链、放弃支付监控和 Plus 权益到账确认。
 - 不包含 CDK、扣次、管理员后台、公告、平台代理、用户数据库或服务器部署配置。
-- AT、代理和任务只保存在当前 Python 进程内，重启后清空。
+- AT、Session、代理和任务只保存在当前 Python 进程内，重启后清空；公开任务接口只返回脱敏卡点和匿名节点引用。
 
 ## 环境
 
@@ -89,17 +90,26 @@ Content-Type: application/json
     {
       "access_token": "eyJ...",
       "email": "email@example.com",
-      "name": "Account Name"
+      "name": "Account Name",
+      "session_token": "...",
+      "device_id": "...",
+      "account_id": "...",
+      "browser_profile": "chrome136",
+      "proxy_ref": "0123456789abcdef",
+      "registered_at": "2026-08-24T10:30:00Z"
     }
   ],
   "proxy_pool": ["host:port:user:pass"]
 }
 ```
 
+前端文本框也可直接粘贴注册项目“导出提链包”产生的 JSONL。`proxy_ref` 只是代理字符串的匿名引用；任务提交时仍需在代理池中重新提供原节点，匹配不到时界面会提示并使用备用节点。
+
 接口返回 `job_id` 和每个账号的随机 `id`。后续接口：
 
 ```http
 GET  /api/jobs/{job_id}
+GET  /api/jobs
 GET  /api/jobs/{job_id}/accounts/{account_id}/qr.png
 POST /api/jobs/{job_id}/accounts/{account_id}/refresh
 POST /api/jobs/{job_id}/accounts/{account_id}/abandon
@@ -107,7 +117,7 @@ POST /api/jobs/{job_id}/cancel
 POST /api/jobs/{job_id}/abandon
 ```
 
-刷新、停止和放弃接口的请求体均为 `{}`。账号级 `abandon` 只释放指定账号，任务级 `abandon` 会释放当前任务内全部活动支付监控。`link_ready=true` 表示链接已经生成；只有 `payment_success=true` 且 `payment_status=completed` 才表示 Plus 权益已确认到账。
+刷新、停止和放弃接口的请求体均为 `{}`。账号级 `abandon` 只释放指定账号，任务级 `abandon` 会释放当前任务内全部活动支付监控。`GET /api/jobs` 用于刷新页面后恢复当前进程内的最近任务。`link_ready=true` 表示链接已经生成；只有 `payment_success=true` 且 `payment_status=completed` 才表示 Plus 权益已确认到账。
 
 ## 测试
 

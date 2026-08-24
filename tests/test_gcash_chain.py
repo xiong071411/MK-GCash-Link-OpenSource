@@ -18,6 +18,26 @@ def checkout_response():
 
 
 class GCashChainProtocolTests(unittest.TestCase):
+    def test_registration_session_device_and_profile_are_reused(self):
+        chain = gcash_chain.GCashChain(
+            token="fixture-token",
+            client_account_id="fixture-client",
+            session_token="fixture-session-token",
+            device_id="registration-device-id",
+            browser_profile="chrome136",
+        )
+        try:
+            cookies = chain._session.cookies.get_dict()
+            self.assertEqual("registration-device-id", chain.device_id)
+            self.assertEqual("chrome136", chain.tls_impersonate)
+            self.assertEqual("registration-device-id", cookies["oai-did"])
+            self.assertEqual(
+                "fixture-session-token",
+                cookies["__Secure-next-auth.session-token"],
+            )
+        finally:
+            chain._session.close()
+
     def test_browser_aligned_protocol_order_and_headers(self):
         requests = []
         sentinel_calls = []
@@ -169,6 +189,82 @@ class GCashChainProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "403"):
                 chain._create_checkout()
         mint.assert_not_called()
+
+    def test_outer_retry_keeps_registration_context_for_network_errors(self):
+        manager = gcash_chain.GCashSessionManager(max_concurrency=1, max_queue=1)
+        task = {
+            "token": "fixture-token",
+            "session_token": "fixture-session",
+            "device_id": "registration-device",
+            "browser_profile": "chrome136",
+            "client_account_id": "fixture-client",
+            "account_id": "fixture-account",
+            "billing_email": "holder@example.com",
+            "billing_name": "Holder",
+            "proxy": "proxy-1.example:8080",
+            "proxy_pool": ["proxy-1.example:8080", "proxy-2.example:8080"],
+            "max_attempts": 2,
+            "status": "running",
+            "current_step": "init",
+            "steps": [],
+            "error_message": "",
+            "gcash_url": "",
+            "expires_at": None,
+            "monitor_id": "",
+            "callback_status": "unavailable",
+            "payment_route": "",
+            "attempts_used": 0,
+            "attempt_history": [],
+            "cancel_requested": False,
+        }
+        constructor_calls = []
+
+        class FakeChain:
+            def __init__(self, **kwargs):
+                constructor_calls.append(kwargs)
+
+            def run(self):
+                failed = len(constructor_calls) == 1
+                return {
+                    "status": "failed" if failed else "success",
+                    "current_step": "create_checkout" if failed else "follow_redirect",
+                    "steps": [],
+                    "error_message": "connection timeout" if failed else "",
+                    "gcash_url": "https://m.gcash.com/gcash-login-web/index.html?netAuthId=test" if not failed else "",
+                    "qr_expires_at": None,
+                    "monitor_id": "",
+                    "callback_status": "unavailable",
+                    "payment_route": "",
+                }
+
+        try:
+            with patch.object(gcash_chain, "GCashChain", FakeChain):
+                manager._process_task(task)
+        finally:
+            manager.executor.shutdown(wait=True)
+
+        self.assertEqual(2, len(constructor_calls))
+        self.assertEqual(
+            ["registration-device", "registration-device"],
+            [call["device_id"] for call in constructor_calls],
+        )
+        self.assertEqual(
+            ["fixture-session", "fixture-session"],
+            [call["session_token"] for call in constructor_calls],
+        )
+        self.assertNotIn("proxy", task["attempt_history"][0])
+        self.assertEqual(
+            gcash_chain._proxy_ref("proxy-1.example:8080"),
+            task["attempt_history"][0]["proxy_ref"],
+        )
+
+    def test_unusual_activity_stops_after_same_session_sentinel_retry(self):
+        result = {
+            "status": "failed",
+            "current_step": "create_checkout",
+            "error_message": "Our systems have detected unusual activity",
+        }
+        self.assertEqual((False, ""), gcash_chain._retry_decision(result))
 
 
 if __name__ == "__main__":

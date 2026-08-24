@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Browser-aligned GCash checkout chain with sticky PH routing."""
 
-import copy, html, json, time, urllib.parse, secrets, re, threading, uuid
+import copy, hashlib, html, json, time, urllib.parse, secrets, re, threading, uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from curl_cffi import requests as curl_requests
@@ -37,9 +37,10 @@ QR_TTL_SECONDS = 5 * 60
 CALLBACK_MAX_ATTEMPTS = 3
 CALLBACK_RETRY_DELAYS = (0.75, 1.5)
 CALLBACK_VERIFY_DELAYS = (0.0, 0.75, 1.5)
-# Keep every retry on one known curl_cffi profile so a test changes only the
-# proxy/checkout state instead of changing the TLS and browser identity too.
-BROWSER_PROFILE = ("chrome145", "145", "145.0.0.0")
+# Registration and checkout use one known curl_cffi profile.  Keeping the
+# browser identity stable removes a risk-context change between both flows.
+BROWSER_PROFILE = ("chrome136", "136", "136.0.0.0")
+BROWSER_PROFILES = {BROWSER_PROFILE[0]: BROWSER_PROFILE}
 TLS_IMPERSONATE, CHROME_MAJOR, CHROME_FULL_VERSION = BROWSER_PROFILE
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -55,6 +56,14 @@ class TokenRevokedError(RuntimeError):
 
 def _bearer(token):
     return f"Bearer {token}"
+
+
+def _proxy_ref(proxy):
+    """Return the registration-compatible, non-secret reference for a proxy."""
+    value = str(proxy or "").strip().rstrip("/")
+    if value and "://" not in value:
+        value = "http://" + value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 def _headers(token=None, account_id=None, content_type="application/json", html=False):
     h = {
@@ -137,7 +146,7 @@ def _proxy_url(proxy):
 
 
 def _browser_cookies(session):
-    """Copy non-auth browser cookies without exposing the bearer token."""
+    """Copy caller-owned ChatGPT browser cookies into an isolated context."""
     output = []
     try:
         cookies = session.cookies.jar
@@ -545,7 +554,7 @@ def _retry_decision(result):
     if current_step == "create_checkout" and any(kw in err for kw in (
         "连接失败", "连接超时", "timeout", "timed out", "refused", "proxy",
         "无法连接", "connection", "reset", "eof", "cloudflare",
-        "unusual activity", "http 500", "http 502", "http 503", "http 504",
+        "http 500", "http 502", "http 503", "http 504",
     )):
         return True, "建单连接失败，换节点重试"
     if current_step == "configure_taxes" and "promo_not_applied" in err:
@@ -580,6 +589,9 @@ class GCashChain:
         on_update=None,
         proxy=None,
         cancel_check=None,
+        session_token="",
+        device_id="",
+        browser_profile="chrome136",
     ):
         self.token = token
         self.client_account_id = client_account_id
@@ -609,17 +621,20 @@ class GCashChain:
         self.error_message = ""
         self.current_step = "init"
         self.steps = []
+        requested_profile = str(browser_profile or "").strip().lower()
         (
             self.tls_impersonate,
             self.chrome_major,
             self.chrome_full_version,
-        ) = BROWSER_PROFILE
+        ) = BROWSER_PROFILES.get(requested_profile, BROWSER_PROFILE)
+        self.browser_profile = self.tls_impersonate
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             f"Chrome/{self.chrome_full_version} Safari/537.36"
         )
-        self.device_id = str(uuid.uuid4())
+        self.device_id = str(device_id or "").strip() or str(uuid.uuid4())
+        self.session_token = str(session_token or "").strip()
         self.oai_session_id = str(uuid.uuid4())
         self.datadog_trace_id = str(secrets.randbits(63))
         self.datadog_parent_id = str(secrets.randbits(63))
@@ -631,6 +646,13 @@ class GCashChain:
             self._session.cookies.set(
                 "oai-did", self.device_id, domain=".chatgpt.com", path="/"
             )
+            if self.session_token:
+                self._session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    self.session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
         except Exception:
             pass
         self._session_transferred = False
@@ -1442,6 +1464,12 @@ class GCashSessionManager:
                     "billing_email": p.get("billing_email", ""),
                     "billing_name": p.get("billing_name", ""),
                     "token": p.get("token", ""),
+                    "session_token": p.get("session_token", ""),
+                    "device_id": p.get("device_id", ""),
+                    "browser_profile": p.get("browser_profile", "chrome136"),
+                    "registered_at": p.get("registered_at", ""),
+                    "proxy_ref": p.get("proxy_ref", ""),
+                    "proxy_affinity": bool(p.get("proxy_affinity")),
                     "proxy": p.get("proxy") or p.get("ph_proxy") or p.get("vn_proxy", ""),
                     "proxy_pool": list(
                         p.get("proxy_pool") or p.get("ph_proxy_pool")
@@ -1632,6 +1660,9 @@ class GCashSessionManager:
                 billing_name=task.get("billing_name", ""),
                 on_update=sync,
                 cancel_check=lambda: bool(task.get("cancel_requested")),
+                session_token=task.get("session_token", ""),
+                device_id=task.get("device_id", ""),
+                browser_profile=task.get("browser_profile", "chrome136"),
             )
             result = chain.run()
             sync(result)
@@ -1642,7 +1673,7 @@ class GCashSessionManager:
                     "status": result.get("status") or "failed",
                     "step": result.get("current_step") or "",
                     "error": result.get("error_message") or "",
-                    "proxy": proxy,
+                    "proxy_ref": _proxy_ref(proxy),
                     "payment_route": result.get("payment_route") or "",
                     "retry_reason": retry_label,
                 })

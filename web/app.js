@@ -15,6 +15,7 @@ const ACTIVE_PAYMENT_STATES = new Set([
   "starting", "waiting_scan", "refreshing", "redirect_captured", "callback_processing",
 ]);
 const JWT_RE = /(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)/;
+const JOB_STORAGE_KEY = "mk_gcash_current_job";
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "")
   .replaceAll("&", "&amp;")
@@ -76,13 +77,21 @@ function lineFields(line) {
 }
 
 function accountFromLine(line, index) {
-  const match = String(line || "").match(JWT_RE);
+  let context = {};
+  try {
+    const parsed = JSON.parse(String(line || ""));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) context = parsed;
+  } catch {}
+  const tokenSource = context.access_token || context.token || context.authorization || line;
+  const match = String(tokenSource || "").match(JWT_RE);
   if (!match) throw new Error("未找到 JWT AT");
   const token = match[1];
   const payload = decodeJwtPayload(token);
   const profile = typeof payload["https://api.openai.com/profile"] === "object"
     ? payload["https://api.openai.com/profile"] || {} : {};
-  const fields = lineFields(line);
+  const fields = Object.keys(context).length
+    ? {email: String(context.email || "").trim(), name: String(context.name || "").trim()}
+    : lineFields(line);
   const expiresAt = Number(payload.exp) || 0;
   const email = fields.email || profile.email || payload.email || payload.preferred_username || "";
   const name = fields.name || profile.name || payload.name || payload.given_name || "";
@@ -93,6 +102,12 @@ function accountFromLine(line, index) {
     name: String(name).trim(),
     expiresAt,
     expired: Boolean(expiresAt && expiresAt <= Math.floor(Date.now() / 1000)),
+    sessionToken: String(context.session_token || "").trim(),
+    deviceId: String(context.device_id || "").trim(),
+    accountId: String(context.account_id || "").trim(),
+    browserProfile: String(context.browser_profile || "chrome136").trim(),
+    proxyRef: String(context.proxy_ref || "").trim(),
+    registeredAt: String(context.registered_at || "").trim(),
   };
 }
 
@@ -287,11 +302,21 @@ function renderProgress(accounts) {
 
 function renderResultCard(account) {
   if (account.status === "failed") {
+    const diagnostics = account.attempt_diagnostics || [];
+    const last = diagnostics.at(-1) || {};
+    const context = account.risk_context || {};
+    const contextText = [
+      context.session_cookie ? "注册 Session" : "仅 AT",
+      context.registration_device ? "注册设备" : "新设备",
+      context.proxy_affinity ? "原注册节点" : "备用节点",
+      context.browser_profile || "chrome136",
+    ].join(" · ");
     return `
       <article class="resultCard failure">
         <div class="failureHead"><b>${esc(account.email || account.name || account.id)}</b><span>提链失败</span></div>
-        <div class="failureMeta">已尝试 ${Number(account.attempts_used) || 0} 次</div>
+        <div class="failureMeta">已尝试 ${Number(account.attempts_used) || 0} 次${last.step ? ` · 卡点 ${esc(last.step)}` : ""}</div>
         <div class="failureMessage">${esc(account.error || "暂时无法确定失败原因，请更换账号或代理后重试")}</div>
+        <details class="rawLink"><summary>风险上下文与尝试诊断</summary><div>${esc(contextText)}${last.proxy_ref ? ` · 节点 ${esc(last.proxy_ref)}` : ""}${last.retry_reason ? ` · ${esc(last.retry_reason)}` : ""}</div></details>
       </article>`;
   }
 
@@ -539,11 +564,18 @@ async function startJob() {
           access_token: account.token,
           email: account.email,
           name: account.name,
+          session_token: account.sessionToken,
+          device_id: account.deviceId,
+          account_id: account.accountId,
+          browser_profile: account.browserProfile,
+          proxy_ref: account.proxyRef,
+          registered_at: account.registeredAt,
         })),
         proxy_pool: proxies,
         max_attempts: Number($("maxAttempts").value) || 5,
       }),
     });
+    sessionStorage.setItem(JOB_STORAGE_KEY, state.job.job_id);
     renderJob();
     updateQueue(state.job.queue);
     schedulePolling(500);
@@ -582,6 +614,7 @@ async function clearResults() {
   clearTimeout(state.pollTimer);
   state.pollTimer = null;
   state.job = null;
+  sessionStorage.removeItem(JOB_STORAGE_KEY);
   closeQr();
   renderJob();
   toast("结果已清空");
@@ -603,6 +636,24 @@ async function health() {
     const node = $("queueStatus");
     node.className = "queueState offline";
     node.querySelector("span").textContent = "服务未连接";
+  }
+}
+
+async function restoreJob() {
+  let jobId = sessionStorage.getItem(JOB_STORAGE_KEY) || "";
+  try {
+    if (!jobId) {
+      const listing = await api("/api/jobs");
+      jobId = listing.jobs?.[0]?.job_id || "";
+    }
+    if (!jobId) return;
+    state.job = await api(`/api/jobs/${jobId}`);
+    sessionStorage.setItem(JOB_STORAGE_KEY, state.job.job_id);
+    renderJob();
+    updateQueue(state.job.queue);
+    schedulePolling(500);
+  } catch {
+    sessionStorage.removeItem(JOB_STORAGE_KEY);
   }
 }
 
@@ -662,5 +713,5 @@ setInterval(() => {
 updateInputCounts();
 renderAccounts();
 renderJob();
-health();
+health().then(restoreJob);
 setInterval(health, 10000);

@@ -51,6 +51,60 @@ class StandaloneAppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "未找到 JWT AT"):
             app.parse_accounts({"tokens": "not-a-token"})
 
+    def test_account_parser_accepts_registration_context_jsonl(self):
+        token = jwt({
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-context"},
+        })
+        context = {
+            "email": "context@example.com",
+            "access_token": token,
+            "session_token": "session-private",
+            "device_id": "registration-device",
+            "account_id": "account-context",
+            "browser_profile": "chrome136",
+            "proxy_ref": "0123456789abcdef",
+            "registered_at": "2026-08-24T10:30:00Z",
+        }
+
+        accounts, warnings = app.parse_accounts({
+            "tokens": json.dumps(context, separators=(",", ":")),
+        })
+
+        self.assertEqual([], warnings)
+        self.assertEqual("session-private", accounts[0]["session_token"])
+        self.assertEqual("registration-device", accounts[0]["device_id"])
+        self.assertEqual("chrome136", accounts[0]["browser_profile"])
+        self.assertEqual("0123456789abcdef", accounts[0]["proxy_ref"])
+        self.assertEqual("2026-08-24T10:30:00Z", accounts[0]["registered_at"])
+
+    def test_create_job_prefers_registration_proxy_reference(self):
+        token = jwt({"exp": int(time.time()) + 3600, "email": "holder@example.com"})
+        first_proxy = "proxy-1.example:8080:user:pass"
+        registration_proxy = "proxy-2.example:8080:user:pass"
+        submitted = []
+        with (
+            patch.object(app.CHAIN_MANAGER, "create_session", return_value="local_0123456789abcdef"),
+            patch.object(app.CHAIN_MANAGER, "submit_jobs", side_effect=lambda _job, rows: submitted.extend(rows)),
+            patch.object(app, "public_job", return_value={"job_id": "local_0123456789abcdef"}),
+        ):
+            result = app.create_job({
+                "accounts": [{
+                    "access_token": token,
+                    "device_id": "registration-device",
+                    "session_token": "session-private",
+                    "proxy_ref": app._proxy_ref(registration_proxy),
+                }],
+                "proxy_pool": [first_proxy, registration_proxy],
+                "max_attempts": 1,
+            })
+
+        self.assertEqual("local_0123456789abcdef", result["job_id"])
+        self.assertEqual(registration_proxy, submitted[0]["proxy"])
+        self.assertTrue(submitted[0]["proxy_affinity"])
+        self.assertEqual("registration-device", submitted[0]["device_id"])
+        self.assertEqual("session-private", submitted[0]["session_token"])
+
     def test_proxy_pool_is_custom_only_and_supports_documented_formats(self):
         pool = app.parse_proxy_pool([
             "proxy.example:8080",
@@ -89,6 +143,10 @@ class StandaloneAppTests(unittest.TestCase):
             "client_account_id": "acct_0123456789abcdef",
             "account_id": "account-private",
             "token": "server-bearer-private",
+            "session_token": "session-cookie-private",
+            "device_id": "registration-device",
+            "browser_profile": "chrome136",
+            "proxy_affinity": True,
             "proxy": "proxy.example:8080:user:private",
             "proxy_pool": ["proxy.example:8080:user:private"],
             "monitor_id": "monitor-private",
@@ -98,7 +156,12 @@ class StandaloneAppTests(unittest.TestCase):
             "gcash_url": "https://m.gcash.com/gcash-login-web/index.html?netAuthId=public-link",
             "expires_at": int(time.time()) + 300,
             "callback_status": "waiting_scan",
-            "attempt_history": [{"proxy": "proxy.example:8080:user:private"}],
+            "attempt_history": [{
+                "step": "create_checkout",
+                "error": "server-bearer-private account-private session-cookie-private",
+                "proxy_ref": "0123456789abcdef",
+                "retry_reason": "",
+            }],
         }
         meta = {
             "accounts": {
@@ -122,6 +185,7 @@ class StandaloneAppTests(unittest.TestCase):
         rendered = json.dumps(public)
         for private in (
             "server-bearer-private",
+            "session-cookie-private",
             "proxy.example",
             "user:private",
             "account-private",
@@ -131,6 +195,11 @@ class StandaloneAppTests(unittest.TestCase):
             self.assertNotIn(private, rendered)
         self.assertTrue(public["link_ready"])
         self.assertTrue(public["qr_ready"])
+        self.assertTrue(public["risk_context"]["session_cookie"])
+        self.assertTrue(public["risk_context"]["registration_device"])
+        self.assertTrue(public["risk_context"]["proxy_affinity"])
+        self.assertEqual("create_checkout", public["attempt_diagnostics"][0]["step"])
+        self.assertEqual("0123456789abcdef", public["attempt_diagnostics"][0]["proxy_ref"])
 
     def test_abandon_account_releases_monitor_and_returns_public_state(self):
         client_id = "acct_0123456789abcdef"
