@@ -127,6 +127,11 @@ class StandaloneAppTests(unittest.TestCase):
         finally:
             manager.executor.shutdown(wait=True)
 
+    def test_proxy_reference_matches_raw_and_url_proxy_formats(self):
+        raw = "proxy.example:8080:user-name:pass-word"
+        url = "http://user-name:pass-word@proxy.example:8080"
+        self.assertEqual(app._proxy_ref(url), app._proxy_ref(raw))
+
     def test_fallback_qr_contains_a_valid_png_for_a_gcash_link(self):
         link = (
             "https://m.gcash.com/gcash-login-web/index.html"

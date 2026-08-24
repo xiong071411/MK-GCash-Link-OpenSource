@@ -60,9 +60,12 @@ def _bearer(token):
 
 def _proxy_ref(proxy):
     """Return the registration-compatible, non-secret reference for a proxy."""
-    value = str(proxy or "").strip().rstrip("/")
-    if value and "://" not in value:
-        value = "http://" + value
+    try:
+        value = _proxy_url(proxy).strip().rstrip("/")
+    except (TypeError, ValueError, RuntimeError):
+        value = str(proxy or "").strip().rstrip("/")
+        if value and "://" not in value:
+            value = "http://" + value
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 def _headers(token=None, account_id=None, content_type="application/json", html=False):
